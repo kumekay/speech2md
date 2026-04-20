@@ -140,16 +140,21 @@ def _config_from_args(args) -> TranscribeConfig:
 
 
 def load_model(config: TranscribeConfig):
-    """Load Qwen3-ASR via vLLM. Heavy — call once, reuse across inputs."""
-    from speech2md._gpu import require_qwen_asr_llm
+    """Load Qwen3-ASR via vLLM. Heavy — call once, reuse across inputs.
+
+    Spawn the engine subprocess with stderr → /dev/null so its tqdm bars
+    and teardown warnings don't leak into our output. The parent's stderr
+    is restored on exit so per-file failure messages still surface."""
+    from speech2md._gpu import require_qwen_asr_llm, silenced_stderr
     Qwen3ASRModel = require_qwen_asr_llm()
-    return Qwen3ASRModel.LLM(
-        model=config.model_name,
-        gpu_memory_utilization=config.gpu_util,
-        max_inference_batch_size=config.batch,
-        max_new_tokens=config.max_new_tokens,
-        max_model_len=config.max_model_len,
-    )
+    with silenced_stderr():
+        return Qwen3ASRModel.LLM(
+            model=config.model_name,
+            gpu_memory_utilization=config.gpu_util,
+            max_inference_batch_size=config.batch,
+            max_new_tokens=config.max_new_tokens,
+            max_model_len=config.max_model_len,
+        )
 
 
 def transcribe_to_paths(model, src: Path, out_md: Path, out_json: Path | None,

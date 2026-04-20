@@ -60,16 +60,17 @@ def main() -> int:
         print(f"audio not found: {audio_path}", file=sys.stderr)
         return 2
 
-    from speech2md._gpu import require_forced_aligner, require_torch
+    from speech2md._gpu import require_forced_aligner, require_torch, silenced_stderr
     torch = require_torch()
     Qwen3ForcedAligner = require_forced_aligner()
 
     print(f"loading {args.aligner} ...")
-    aligner = Qwen3ForcedAligner.from_pretrained(
-        args.aligner,
-        dtype=torch.bfloat16,
-        device_map="cuda:0",
-    )
+    with silenced_stderr():
+        aligner = Qwen3ForcedAligner.from_pretrained(
+            args.aligner,
+            dtype=torch.bfloat16,
+            device_map="cuda:0",
+        )
 
     workdir = Path(tempfile.mkdtemp(prefix="speech2md-align-"))
     try:

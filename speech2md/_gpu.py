@@ -2,6 +2,7 @@
 the `[gpu]` optional-dependency group isn't installed."""
 from __future__ import annotations
 
+import contextlib
 import os
 import sys
 import warnings
@@ -14,12 +15,33 @@ os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
 warnings.filterwarnings("ignore", category=SyntaxWarning)
 
 
-def silence_teardown() -> None:
-    """Redirect stderr to /dev/null so vLLM/NCCL shutdown noise (engine-core
-    `died unexpectedly` ERROR, `destroy_process_group` warning) doesn't trail
-    after the last useful line. Call right before returning from `main()`."""
+@contextlib.contextmanager
+def silenced_stderr():
+    """fd-level redirect of stderr to /dev/null. Subprocesses spawned inside
+    inherit the devnull fd, so their stderr stays silenced even after the
+    parent restores its own."""
     sys.stderr.flush()
-    sys.stderr = open(os.devnull, "w")
+    saved = os.dup(2)
+    devnull = os.open(os.devnull, os.O_WRONLY)
+    try:
+        os.dup2(devnull, 2)
+        os.close(devnull)
+        yield
+    finally:
+        sys.stderr.flush()
+        os.dup2(saved, 2)
+        os.close(saved)
+
+
+def silence_teardown() -> None:
+    """Redirect parent stderr to /dev/null so the parent's own teardown
+    chatter (vLLM `Engine core ... died` ERROR, NCCL `destroy_process_group`
+    warning) doesn't trail after the last useful line. Call right before
+    returning from `main()`."""
+    sys.stderr.flush()
+    devnull = os.open(os.devnull, os.O_WRONLY)
+    os.dup2(devnull, 2)
+    os.close(devnull)
 
 _HINT = (
     "This command needs the GPU stack (torch + qwen-asr + vLLM). Install with:\n"
