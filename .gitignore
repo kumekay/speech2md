@@ -1,0 +1,30 @@
+# python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# uv
+.uv/
+
+# audio + video + transcription artifacts (user data)
+audio/
+*.m4a
+*.mp3
+*.wav
+*.flac
+*.ogg
+*.opus
+*.mp4
+*.mkv
+*.webm
+
+# editor
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# claude code local state
+.claude/
