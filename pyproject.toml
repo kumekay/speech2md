@@ -12,12 +12,14 @@ dependencies = []
 gpu = [
     "qwen-asr[vllm]",
     "torch",
+    "pyannote.audio",
 ]
 dev = ["pytest"]
 
 [project.scripts]
 speech2md = "speech2md.transcribe:main"
 align-transcription = "speech2md.align:main"
+diarize-transcription = "speech2md.diarize:main"
 
 [build-system]
 requires = ["hatchling"]

@@ -10,6 +10,7 @@ venv/
 
 # audio + video + transcription artifacts (user data)
 audio/
+local_test_files/
 *.m4a
 *.mp3
 *.wav

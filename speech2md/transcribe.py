@@ -136,6 +136,69 @@ def _config_from_args(args) -> TranscribeConfig:
     )
 
 
+# ------------------------------ pipeline glue ------------------------------
+
+
+def _validate_outputs(*, no_md: bool, srt: bool, json_out: bool) -> None:
+    """`--no-md` must leave at least one output on disk."""
+    if no_md and not (srt or json_out):
+        print("error: --no-md requires --srt or --json (or both)", file=sys.stderr)
+        raise SystemExit(2)
+
+
+def _safe_unlink(p: Path) -> None:
+    try:
+        p.unlink()
+    except FileNotFoundError:
+        pass
+
+
+def _reconcile_outputs(src: Path, *, diarize: bool, srt: bool,
+                       json_out: bool, no_md: bool) -> None:
+    """Post-pipeline: rename the diarize/align intermediates into the
+    user's requested final set and delete the rest. Idempotent — missing
+    files are fine.
+
+    File map (before reconcile, when the full pipeline runs):
+      <stem>.md            prose md        (speech2md)
+      <stem>.json          chunks sidecar  (speech2md --json)
+      <stem>.words.json    word timings    (align)
+      <stem>.srt           word-level SRT  (align)
+      <stem>.speakers.md   diarized md     (diarize, if --diarize)
+      <stem>.speakers.srt  speaker SRT     (diarize, if --diarize)
+    """
+    stem = src.stem
+    prose_md = src.with_name(f"{stem}.md")
+    chunks_json = src.with_name(f"{stem}.json")
+    words_json = src.with_name(f"{stem}.words.json")
+    word_srt = src.with_name(f"{stem}.srt")
+    speakers_md = src.with_name(f"{stem}.speakers.md")
+    speakers_srt = src.with_name(f"{stem}.speakers.srt")
+
+    # Finalize the .md slot. When --diarize, the speakers.md replaces prose.md.
+    if no_md:
+        _safe_unlink(prose_md)
+        _safe_unlink(speakers_md)
+    elif diarize and speakers_md.exists():
+        _safe_unlink(prose_md)
+        speakers_md.rename(prose_md)
+
+    # Finalize the .srt slot.
+    if srt:
+        if diarize and speakers_srt.exists():
+            _safe_unlink(word_srt)
+            speakers_srt.rename(word_srt)
+        # else: word_srt (from align) is already the right file
+    else:
+        _safe_unlink(word_srt)
+        _safe_unlink(speakers_srt)
+
+    # Intermediate JSONs are only kept when --json is explicit.
+    if not json_out:
+        _safe_unlink(chunks_json)
+        _safe_unlink(words_json)
+
+
 # --------------------------------- core ------------------------------------
 
 
@@ -267,9 +330,32 @@ def main() -> int:
     p.add_argument("--skip-existing", action="store_true",
                    help="skip files whose .md already exists")
     p.add_argument("--json", action="store_true",
-                   help="also emit <name>.json sidecar with per-chunk "
-                        "timestamps (needed by align-transcription)")
+                   help="keep the per-chunk JSON sidecar (and the "
+                        "word-level JSON when --srt/--diarize ran alignment)")
+    # Output selectors
+    p.add_argument("--diarize", action="store_true",
+                   help="run speaker diarization; the .md is then speaker-grouped")
+    p.add_argument("--srt", action="store_true",
+                   help="also emit a subtitle file (word-level without --diarize, "
+                        "sentence-ish with speaker labels when --diarize)")
+    p.add_argument("--no-md", action="store_true",
+                   help="suppress the .md output (requires --srt or --json)")
+    # Diarization pass-through flags (only used when --diarize)
+    p.add_argument("--num-speakers", type=int, default=None,
+                   help="pin speaker count (diarize only)")
+    p.add_argument("--min-speakers", type=int, default=None,
+                   help="minimum speaker count (diarize only)")
+    p.add_argument("--max-speakers", type=int, default=None,
+                   help="maximum speaker count (diarize only)")
+    p.add_argument("--max-gap", type=float, default=None,
+                   help="new SRT cue when pause between words exceeds this "
+                        "(diarize only, default 1.0)")
+    p.add_argument("--hf-token", default=None,
+                   help="Hugging Face token for the gated pyannote pipeline "
+                        "(defaults to $HF_TOKEN / $HUGGINGFACE_TOKEN / cached login)")
     args = p.parse_args()
+
+    _validate_outputs(no_md=args.no_md, srt=args.srt, json_out=args.json)
 
     missing = [x for x in args.inputs if not x.exists()]
     if missing:
@@ -277,6 +363,13 @@ def main() -> int:
             print(f"input not found: {x}", file=sys.stderr)
         return 2
 
+    if args.diarize or args.srt:
+        return _run_pipeline(args)
+    return _run_transcribe_only(args)
+
+
+def _run_transcribe_only(args) -> int:
+    """Fast path: single-stage transcribe, no align/diarize subprocesses."""
     config = _config_from_args(args)
     print(f"loading vLLM {config.model_name} ...")
     t0 = time.time()
@@ -291,16 +384,114 @@ def main() -> int:
             print(f"  FAILED {src.name}: {e}", file=sys.stderr)
             failures.append((src, str(e)))
 
-    rc = 0
+    rc = 1 if failures else 0
     if failures:
         print(f"\n{len(failures)} failures:", file=sys.stderr)
         for src, err in failures:
             print(f"  {src}: {err}", file=sys.stderr)
-        rc = 1
+
+    if args.no_md or not args.json:
+        # `speech2md` default-writes .md and optionally .json; reconcile
+        # to honor --no-md / drop --json sidecar when not asked for.
+        for src in args.inputs:
+            _reconcile_outputs(
+                src,
+                diarize=False,
+                srt=False,
+                json_out=args.json,
+                no_md=args.no_md,
+            )
 
     from speech2md._gpu import silence_teardown
     silence_teardown()
     return rc
+
+
+def _run_pipeline(args) -> int:
+    """Orchestration path (when --srt or --diarize): run transcribe,
+    align, and optionally diarize as separate subprocesses so each
+    model gets a clean GPU, then reconcile outputs to match flags.
+
+    Batch semantics: every stage handles all inputs in one subprocess
+    call, so each heavy model is loaded exactly once per stage."""
+    # Phase 1: transcribe. Self-subprocess with --json so the chunks
+    # sidecar is on disk for align. No --diarize/--srt on this call, so
+    # the child takes the fast path and won't recurse.
+    transcribe_cmd = [
+        sys.executable, "-m", "speech2md.transcribe",
+        "--json",
+        *(str(x) for x in args.inputs),
+        "--target", str(args.target),
+        "--max-chunk", str(args.max_chunk),
+        "--noise-db", str(args.noise_db),
+        "--min-sil", str(args.min_sil),
+        "--model", args.model,
+        "--gpu-util", str(args.gpu_util),
+        "--max-model-len", str(args.max_model_len),
+        "--batch", str(args.batch),
+        "--max-new-tokens", str(args.max_new_tokens),
+    ]
+    if args.language:
+        transcribe_cmd += ["--language", args.language]
+    if args.keep_chunks:
+        transcribe_cmd.append("--keep-chunks")
+    if args.skip_existing:
+        transcribe_cmd.append("--skip-existing")
+
+    if subprocess.call(transcribe_cmd) != 0:
+        return 1
+
+    # Phase 2: align. Only feed in files whose chunks JSON was actually
+    # written — a prior failure in phase 1 (or --skip-existing) can
+    # leave a subset.
+    chunks_jsons = [
+        src.with_name(f"{src.stem}.json") for src in args.inputs
+        if src.with_name(f"{src.stem}.json").exists()
+    ]
+    if not chunks_jsons:
+        return 1
+    align_cmd = [
+        sys.executable, "-m", "speech2md.align",
+        *(str(x) for x in chunks_jsons),
+    ]
+    if subprocess.call(align_cmd) != 0:
+        return 1
+
+    # Phase 3: diarize (only when --diarize).
+    if args.diarize:
+        words_jsons = [
+            src.with_name(f"{src.stem}.words.json") for src in args.inputs
+            if src.with_name(f"{src.stem}.words.json").exists()
+        ]
+        if not words_jsons:
+            return 1
+        diarize_cmd = [
+            sys.executable, "-m", "speech2md.diarize",
+            *(str(x) for x in words_jsons),
+        ]
+        if args.num_speakers is not None:
+            diarize_cmd += ["--num-speakers", str(args.num_speakers)]
+        if args.min_speakers is not None:
+            diarize_cmd += ["--min-speakers", str(args.min_speakers)]
+        if args.max_speakers is not None:
+            diarize_cmd += ["--max-speakers", str(args.max_speakers)]
+        if args.max_gap is not None:
+            diarize_cmd += ["--max-gap", str(args.max_gap)]
+        if args.hf_token:
+            diarize_cmd += ["--token", args.hf_token]
+        if subprocess.call(diarize_cmd) != 0:
+            return 1
+
+    # Phase 4: per-file rename / cleanup to match requested outputs.
+    for src in args.inputs:
+        _reconcile_outputs(
+            src,
+            diarize=args.diarize,
+            srt=args.srt,
+            json_out=args.json,
+            no_md=args.no_md,
+        )
+    return 0
 
 
 if __name__ == "__main__":

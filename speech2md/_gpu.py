@@ -78,3 +78,18 @@ def require_forced_aligner():
         print(f"error: qwen-asr is not installed.\n\n{_HINT}", file=sys.stderr)
         raise SystemExit(3)
     return Qwen3ForcedAligner
+
+
+def require_pyannote():
+    require_torch()
+    try:
+        from pyannote.audio import Pipeline
+    except ImportError:
+        print(
+            "error: pyannote.audio is not installed.\n\n"
+            "Install the [gpu] extra (or add 'pyannote.audio' manually):\n"
+            "    uv tool install -e '<speech2md-path>[gpu]' --force",
+            file=sys.stderr,
+        )
+        raise SystemExit(3)
+    return Pipeline

@@ -157,3 +157,129 @@ def test_transcribe_to_paths_skips_empty_text(tmp_path: Path, fake_ffmpeg, monke
     payload = json.loads(out_json.read_text())
     # JSON sidecar keeps the empty chunk (caller / aligner may want it).
     assert len(payload["chunks"]) == 3
+
+
+# ---------------- pipeline output reconciliation -----------------
+
+
+def _seed_pipeline_outputs(src: Path, *, with_align: bool,
+                           with_diarize: bool) -> dict[str, Path]:
+    """Create the files each pipeline stage would actually produce, so
+    the reconciliation logic has realistic inputs to prune/rename. If
+    align didn't run there's no words.json or word-SRT. If diarize
+    didn't run there's no speakers.md / speakers.srt."""
+    stem = src.stem
+    files = {
+        "prose_md": src.with_name(f"{stem}.md"),
+        "chunks_json": src.with_name(f"{stem}.json"),
+    }
+    files["prose_md"].write_text("prose md", encoding="utf-8")
+    files["chunks_json"].write_text("{}", encoding="utf-8")
+    if with_align:
+        files["words_json"] = src.with_name(f"{stem}.words.json")
+        files["word_srt"] = src.with_name(f"{stem}.srt")
+        files["words_json"].write_text("{}", encoding="utf-8")
+        files["word_srt"].write_text("word srt", encoding="utf-8")
+    if with_diarize:
+        files["speakers_md"] = src.with_name(f"{stem}.speakers.md")
+        files["speakers_srt"] = src.with_name(f"{stem}.speakers.srt")
+        files["speakers_md"].write_text("diarized md", encoding="utf-8")
+        files["speakers_srt"].write_text("speakers srt", encoding="utf-8")
+    return files
+
+
+def test_reconcile_diarize_only_keeps_diarized_md(tmp_path: Path):
+    src = tmp_path / "audio.m4a"
+    f = _seed_pipeline_outputs(src, with_align=True, with_diarize=True)
+    transcribe._reconcile_outputs(
+        src, diarize=True, srt=False, json_out=False, no_md=False
+    )
+    assert f["prose_md"].read_text() == "diarized md"
+    assert not f["chunks_json"].exists()
+    assert not f["words_json"].exists()
+    assert not f["word_srt"].exists()
+    assert not f["speakers_md"].exists()
+    assert not f["speakers_srt"].exists()
+
+
+def test_reconcile_diarize_with_srt_renames_speakers_srt(tmp_path: Path):
+    src = tmp_path / "audio.m4a"
+    f = _seed_pipeline_outputs(src, with_align=True, with_diarize=True)
+    transcribe._reconcile_outputs(
+        src, diarize=True, srt=True, json_out=False, no_md=False
+    )
+    assert f["prose_md"].read_text() == "diarized md"
+    assert f["word_srt"].read_text() == "speakers srt"
+    assert not f["speakers_md"].exists()
+    assert not f["speakers_srt"].exists()
+    assert not f["chunks_json"].exists()
+    assert not f["words_json"].exists()
+
+
+def test_reconcile_srt_only_no_diarize_keeps_word_srt(tmp_path: Path):
+    src = tmp_path / "audio.m4a"
+    f = _seed_pipeline_outputs(src, with_align=True, with_diarize=False)
+    transcribe._reconcile_outputs(
+        src, diarize=False, srt=True, json_out=False, no_md=False
+    )
+    assert f["prose_md"].read_text() == "prose md"
+    assert f["word_srt"].read_text() == "word srt"
+    assert not f["chunks_json"].exists()
+    assert not f["words_json"].exists()
+
+
+def test_reconcile_no_md_srt_only(tmp_path: Path):
+    src = tmp_path / "audio.m4a"
+    f = _seed_pipeline_outputs(src, with_align=True, with_diarize=True)
+    transcribe._reconcile_outputs(
+        src, diarize=True, srt=True, json_out=False, no_md=True
+    )
+    assert not f["prose_md"].exists()
+    assert not f["speakers_md"].exists()
+    assert f["word_srt"].read_text() == "speakers srt"
+
+
+def test_reconcile_json_only_no_md_no_diarize(tmp_path: Path):
+    src = tmp_path / "audio.m4a"
+    f = _seed_pipeline_outputs(src, with_align=False, with_diarize=False)
+    transcribe._reconcile_outputs(
+        src, diarize=False, srt=False, json_out=True, no_md=True
+    )
+    assert not f["prose_md"].exists()
+    assert f["chunks_json"].exists()
+
+
+def test_reconcile_json_and_diarize_keeps_words_json(tmp_path: Path):
+    src = tmp_path / "audio.m4a"
+    f = _seed_pipeline_outputs(src, with_align=True, with_diarize=True)
+    transcribe._reconcile_outputs(
+        src, diarize=True, srt=False, json_out=True, no_md=True
+    )
+    assert not f["prose_md"].exists()
+    assert not f["speakers_md"].exists()
+    assert f["chunks_json"].exists()
+    assert f["words_json"].exists()
+
+
+def test_reconcile_default_prose_only(tmp_path: Path):
+    """Fast path — only prose .md written by speech2md, no intermediates."""
+    src = tmp_path / "audio.m4a"
+    prose = src.with_name("audio.md")
+    prose.write_text("prose", encoding="utf-8")
+    transcribe._reconcile_outputs(
+        src, diarize=False, srt=False, json_out=False, no_md=False
+    )
+    assert prose.read_text() == "prose"
+
+
+def test_validate_outputs_no_md_requires_output():
+    with pytest.raises(SystemExit):
+        transcribe._validate_outputs(no_md=True, srt=False, json_out=False)
+
+
+def test_validate_outputs_no_md_with_srt_ok():
+    transcribe._validate_outputs(no_md=True, srt=True, json_out=False)
+
+
+def test_validate_outputs_no_md_with_json_ok():
+    transcribe._validate_outputs(no_md=True, srt=False, json_out=True)

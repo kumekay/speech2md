@@ -29,13 +29,15 @@ uv tool install --python 3.12 -e '/path/to/speech2md[gpu]' --force
 uv tool install --python 3.12 'speech2md[gpu] @ git+https://github.com/kumekay/speech2md'
 ```
 
-Exposes two commands on `$PATH`:
+Exposes three commands on `$PATH`:
 
 - `speech2md` — audio → prose markdown.
 - `align-transcription` — word-level timestamps.
+- `diarize-transcription` — speaker diarization on top of the word-level
+  output (who spoke when).
 
-The `[gpu]` extra pulls `torch` + `qwen-asr[vllm]` and is required at
-runtime.
+The `[gpu]` extra pulls `torch` + `qwen-asr[vllm]` + `pyannote.audio` and
+is required at runtime.
 
 `--force` re-installs if you already have `speech2md` as a tool without
 the extra.
@@ -63,20 +65,41 @@ re-transcribing files that already have a `.md` next to them.
 
 ## Output formats
 
-By default only a prose `.md` is written. The JSON sidecar is
-opt-in:
+`speech2md` can run just the transcription step, or drive the full
+pipeline (transcribe → align → diarize) in a single command. Output
+is controlled by four orthogonal flags:
 
-| Flag | File | Content |
-|------|------|---------|
-| default | `<name>.md` | flat prose, one long line, no chunk markers |
-| `--json` | `<name>.json` | per-chunk start/end/text, used as input to `align-transcription` |
+| Flag | Effect |
+|------|--------|
+| `--diarize` | run speaker diarization; the `.md` becomes speaker-grouped |
+| `--srt` | also emit a subtitle file — word-level without `--diarize`, sentence-ish with speaker labels when `--diarize` |
+| `--json` | keep the per-chunk `.json` sidecar (and `.words.json` when alignment ran) |
+| `--no-md` | suppress the `.md` output (requires `--srt` or `--json`) |
 
-`align-transcription` then produces:
+Intermediate artifacts that the pipeline produces on the way (the
+chunks JSON, the word-level JSON, the pre-diarization SRT) are cleaned
+up by default; pass `--json` to keep them.
 
-| File | Content |
-|------|---------|
-| `<name>.words.json` | `[{start, end, text}, …]` flat list of words |
-| `<name>.srt` | one SRT cue per word |
+The final files on disk after one of the common recipes:
+
+```bash
+speech2md audio.m4a                      # audio.md (prose)
+speech2md audio.m4a --diarize            # audio.md (diarized)
+speech2md audio.m4a --diarize --srt      # audio.md (diarized) + audio.srt (speaker-labeled)
+speech2md audio.m4a --srt                # audio.md (prose) + audio.srt (word-level)
+speech2md audio.m4a --no-md --srt --diarize    # audio.srt only (speaker-labeled)
+speech2md audio.m4a --no-md --json --diarize   # audio.json + audio.words.json only
+```
+
+`align-transcription` and `diarize-transcription` are also exposed
+as standalone commands for scripts that want to run a single stage
+against pre-existing artifacts. Both accept multiple JSON inputs in
+one call so the aligner / pyannote pipeline loads once per batch:
+
+```bash
+align-transcription a.json b.json c.json
+diarize-transcription a.words.json b.words.json
+```
 
 ## How it works
 
@@ -101,21 +124,60 @@ with the align step too.
 
 ## Word-level timestamps
 
-vLLM and the forced aligner together OOM on 24 GB, so alignment runs
-as a separate pass over the JSON sidecar:
+With `speech2md --srt` the aligner runs as a second subprocess (vLLM
+and the forced aligner together OOM on 24 GB, so they need separate
+processes). The `audio.srt` output has one cue per word.
 
-```bash
-speech2md --json audio/recording.m4a
-align-transcription audio/recording.json
-```
+The aligner is `Qwen/Qwen3-ForcedAligner-0.6B` — about 1–2 GB VRAM on
+its own.
 
-Outputs `audio/recording.words.json` and `audio/recording.srt`. The
-aligner is `Qwen/Qwen3-ForcedAligner-0.6B` — about 1–2 GB VRAM on its
-own.
+## Speaker diarization
+
+`speech2md --diarize` runs `pyannote/speaker-diarization-community-1`
+over the audio and attaches speaker labels to the word-level
+transcript. Under the hood that's three subprocesses chained: the
+aligner (and therefore the chunks sidecar) is a prerequisite because
+the 4-minute chunks are too coarse to attribute to a single speaker —
+we need word-level timing to draw speaker boundaries.
+
+Output shape:
+
+- `.md` is grouped under `## SPEAKER_XX` headings, with consecutive
+  same-speaker segments collapsed into a single paragraph.
+- `.srt` (when combined with `--srt`) has one cue per contiguous
+  speaker run, further split on long pauses or sentence-closing
+  punctuation so cues stay subtitle-sized. Each cue is prefixed with
+  the speaker label.
+
+First-time setup for diarization:
+
+1. Accept the user conditions on
+   https://huggingface.co/pyannote/speaker-diarization-community-1.
+2. `huggingface-cli login` once (or pass `--hf-token` to `speech2md` /
+   set `$HF_TOKEN`). The command also picks up a cached token at
+   `~/.cache/huggingface/token`.
+
+Segment boundaries are drawn on speaker change, on a pause longer than
+`--max-gap` (default 1.0 s), or on sentence-closing punctuation at the
+end of the current segment — whichever comes first.
 
 ## Common flags
 
-`speech2md`:
+`speech2md` output selectors (see **Output formats** above for the
+full matrix):
+
+- `--diarize` / `--srt` / `--json` / `--no-md` — pick what lands on
+  disk.
+
+`speech2md` diarization tuning (only used with `--diarize`):
+
+- `--num-speakers N` — pin the speaker count.
+- `--min-speakers` / `--max-speakers` — bound the auto-detect.
+- `--max-gap 1.0` — start a new SRT cue when the pause between words
+  exceeds this (seconds).
+- `--hf-token` — override `$HF_TOKEN` / cached login.
+
+`speech2md` ASR tuning:
 
 - `--language "Russian"` — force a language instead of auto-detect.
   Useful for short clips where auto-detect sometimes guesses wrong.
@@ -130,14 +192,28 @@ own.
   sharing the GPU with something else.
 - `--batch 32` — vLLM's `max_inference_batch_size`. Rarely worth
   changing unless you've got a lot of short chunks.
-- `--json` — also emit the per-chunk sidecar for `align-transcription`.
 - `--skip-existing` — no-op on files whose `.md` already exists.
 - `--keep-chunks` — keep the temporary `wav` chunks for debugging.
 
 `align-transcription`:
 
 - `--aligner Qwen/Qwen3-ForcedAligner-0.6B` — swap the aligner model.
-- `-o / --srt` — override output paths; otherwise derived from input.
+- `-o / --srt` — override output paths; single-input mode only.
+
+`diarize-transcription`:
+
+- `--pipeline pyannote/speaker-diarization-community-1` — swap the
+  pyannote pipeline.
+- `--token` / `$HF_TOKEN` / `$HUGGINGFACE_TOKEN` — Hugging Face token.
+  Falls back to `~/.cache/huggingface/token` written by
+  `huggingface-cli login`.
+- `--num-speakers` — fix the speaker count when you know it; otherwise
+  use `--min-speakers` / `--max-speakers` to bound the auto-detect.
+- `--max-gap 1.0` — start a new SRT cue when the pause between words
+  exceeds this (seconds).
+- `--audio` — source audio path override (default: the `source` field
+  in the words JSON).
+- `--out-md` / `--out-srt` — override output paths.
 
 ## Repository layout
 
@@ -145,6 +221,7 @@ own.
 speech2md/
   transcribe.py      ASR pipeline (vLLM + Qwen3-ASR)
   align.py           word-level timestamps post-pass
+  diarize.py         speaker diarization post-pass (pyannote.audio)
   _gpu.py            GPU-stack import guard
 tests/               pytest suite (TDD for production code; see CLAUDE.md)
 ```
