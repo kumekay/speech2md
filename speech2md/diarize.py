@@ -85,10 +85,17 @@ class Segment:
 
 
 def speaker_at(t: float, turns: list[Turn]) -> str | None:
-    """Speaker whose turn covers time `t`, or None if `t` sits in a gap."""
+    """Speaker whose turn covers time `t`, or None if `t` sits in a gap.
+
+    Treat turns as half-open intervals (`[start, end)`) so a timestamp that
+    lands exactly on a shared boundary belongs to the following turn rather
+    than being swallowed by the previous one.
+    """
     for turn in turns:
-        if turn.start <= t <= turn.end:
+        if turn.start <= t < turn.end:
             return turn.speaker
+    if turns and t == turns[-1].end:
+        return turns[-1].speaker
     return None
 
 
@@ -100,17 +107,152 @@ def nearest_speaker(t: float, turns: list[Turn]) -> str | None:
     return best.speaker
 
 
+def _overlap(a_start: float, a_end: float, b_start: float, b_end: float) -> float:
+    return max(0.0, min(a_end, b_end) - max(a_start, b_start))
+
+
+def speaker_for_word(word: Word, turns: list[Turn]) -> str | None:
+    """Pick the speaker with the largest overlap against the full word span.
+
+    This is more robust than midpoint-only assignment when a word straddles a
+    boundary or when diarization turns overlap slightly. Exact ties fall back
+    to midpoint containment, then nearest-turn selection for gap cases.
+    """
+    if not turns:
+        return None
+
+    best_overlap = 0.0
+    best_speakers: list[str] = []
+    for turn in turns:
+        overlap = _overlap(word.start, word.end, turn.start, turn.end)
+        if overlap > best_overlap:
+            best_overlap = overlap
+            best_speakers = [turn.speaker]
+        elif overlap == best_overlap and overlap > 0:
+            best_speakers.append(turn.speaker)
+
+    if len(best_speakers) == 1:
+        return best_speakers[0]
+    if len(best_speakers) > 1:
+        mid = (word.start + word.end) / 2
+        return speaker_at(mid, turns) or nearest_speaker(mid, turns)
+
+    mid = (word.start + word.end) / 2
+    return speaker_at(mid, turns) or nearest_speaker(mid, turns)
+
+
+def _speaker_overlap(word: Word, speaker: str, turns: list[Turn]) -> float:
+    return sum(
+        _overlap(word.start, word.end, turn.start, turn.end)
+        for turn in turns
+        if turn.speaker == speaker
+    )
+
+
+_BOUNDARY_GAP_WEIGHT = 0.5
+_SHORT_WORD_MAX = 0.35
+
+
+def _speaker_runs(speakers: list[str]) -> list[tuple[int, int, str]]:
+    runs: list[tuple[int, int, str]] = []
+    if not speakers:
+        return runs
+    start = 0
+    current = speakers[0]
+    for i, speaker in enumerate(speakers[1:], 1):
+        if speaker != current:
+            runs.append((start, i, current))
+            start = i
+            current = speaker
+    runs.append((start, len(speakers), current))
+    return runs
+
+
+
+def _candidate_boundary_score(words: list[Word], turns: list[Turn],
+                              left_speaker: str, right_speaker: str,
+                              split_after: int, start: int, end: int) -> float:
+    score = 0.0
+    for i in range(start, end):
+        speaker = left_speaker if i <= split_after else right_speaker
+        score += _speaker_overlap(words[i], speaker, turns)
+    if start <= split_after < end - 1:
+        gap = max(0.0, words[split_after + 1].start - words[split_after].end)
+        score += _BOUNDARY_GAP_WEIGHT * gap
+    return score
+
+
+
+def _smooth_boundary_words(words: list[Word], speakers: list[str],
+                           turns: list[Turn]) -> list[str]:
+    """Allow a single short edge word to cross a speaker boundary.
+
+    Diarization boundaries are often a fraction of a second late/early. After
+    per-word overlap assignment, inspect each speaker-change boundary and allow
+    the split to move by one word in either direction when that creates a more
+    pause-aligned boundary.
+    """
+    speakers = speakers[:]
+    while True:
+        runs = _speaker_runs(speakers)
+        changed = False
+        for run_i in range(len(runs) - 1):
+            left_start, left_end, left_speaker = runs[run_i]
+            right_start, right_end, right_speaker = runs[run_i + 1]
+            current_split = left_end - 1
+            candidates = [current_split]
+
+            left_word = words[current_split]
+            if (
+                left_end - left_start >= 2
+                and (left_word.end - left_word.start) <= _SHORT_WORD_MAX
+            ):
+                candidates.append(current_split - 1)
+
+            right_word = words[right_start]
+            if (
+                right_end - right_start >= 2
+                and (right_word.end - right_word.start) <= _SHORT_WORD_MAX
+            ):
+                candidates.append(current_split + 1)
+
+            start = max(left_start, current_split - 1)
+            end = min(right_end, right_start + 2)
+            best_split = current_split
+            best_score = _candidate_boundary_score(
+                words, turns, left_speaker, right_speaker,
+                current_split, start, end,
+            )
+            for split_after in candidates[1:]:
+                score = _candidate_boundary_score(
+                    words, turns, left_speaker, right_speaker,
+                    split_after, start, end,
+                )
+                if score > best_score:
+                    best_score = score
+                    best_split = split_after
+
+            if best_split != current_split:
+                for i in range(left_start, right_end):
+                    speakers[i] = left_speaker if i <= best_split else right_speaker
+                changed = True
+                break
+        if not changed:
+            return speakers
+
+
+
 def group_words(words: list[Word], turns: list[Turn],
                 max_gap: float) -> list[Segment]:
     """Walk words in time order and glue them into Segments. Start a new
     segment whenever the speaker changes, a pause longer than `max_gap`
     appears, or the current segment ends with sentence-closing punctuation."""
+    clean_words = [w for w in words if (w.text or "").strip()]
+    speakers = [speaker_for_word(w, turns) or "UNKNOWN" for w in clean_words]
+    speakers = _smooth_boundary_words(clean_words, speakers, turns)
+
     segs: list[Segment] = []
-    for w in words:
-        if not (w.text or "").strip():
-            continue
-        mid = (w.start + w.end) / 2
-        spk = speaker_at(mid, turns) or nearest_speaker(mid, turns) or "UNKNOWN"
+    for w, spk in zip(clean_words, speakers):
         if not segs:
             segs.append(Segment(spk, w.start, w.end, w.text.strip()))
             continue

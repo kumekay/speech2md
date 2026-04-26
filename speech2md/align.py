@@ -131,8 +131,14 @@ def main() -> int:
               "single input JSON", file=sys.stderr)
         return 2
 
-    from speech2md._gpu import require_forced_aligner, require_torch, silenced_stderr
+    from speech2md._gpu import (
+        require_cuda,
+        require_forced_aligner,
+        require_torch,
+        silenced_stderr,
+    )
     torch = require_torch()
+    require_cuda(torch, command="align-transcription")
     Qwen3ForcedAligner = require_forced_aligner()
 
     print(f"loading {args.aligner} ...")

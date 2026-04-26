@@ -2,8 +2,10 @@
 from __future__ import annotations
 
 import json
+import sys
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -128,7 +130,11 @@ def test_transcribe_to_paths_multi_chunk(tmp_path: Path, monkeypatch, fake_ffmpe
         ]
     )
     transcribe.transcribe_to_paths(
-        model, src, out_md, None, transcribe.TranscribeConfig()
+        model,
+        src,
+        out_md,
+        None,
+        transcribe.TranscribeConfig(target=240.0, max_chunk=290.0),
     )
 
     assert out_md.read_text() == "first second third\n"
@@ -150,7 +156,11 @@ def test_transcribe_to_paths_skips_empty_text(tmp_path: Path, fake_ffmpeg, monke
         ]
     )
     transcribe.transcribe_to_paths(
-        model, src, out_md, out_json, transcribe.TranscribeConfig()
+        model,
+        src,
+        out_md,
+        out_json,
+        transcribe.TranscribeConfig(target=240.0, max_chunk=290.0),
     )
 
     assert out_md.read_text() == "one three\n"
@@ -283,3 +293,66 @@ def test_validate_outputs_no_md_with_srt_ok():
 
 def test_validate_outputs_no_md_with_json_ok():
     transcribe._validate_outputs(no_md=True, srt=False, json_out=True)
+
+
+def test_run_pipeline_uses_short_alignment_chunks_and_restores_prose_md(
+    tmp_path: Path, monkeypatch
+):
+    src = tmp_path / "audio.m4a"
+    src.write_bytes(b"fake")
+    args = SimpleNamespace(
+        inputs=[src],
+        target=900.0,
+        max_chunk=1200.0,
+        align_target=75.0,
+        align_max_chunk=90.0,
+        noise_db=-35,
+        min_sil=0.4,
+        language=None,
+        model="Qwen/Qwen3-ASR-1.7B",
+        gpu_util=0.6,
+        max_model_len=8192,
+        batch=32,
+        max_new_tokens=4096,
+        keep_chunks=False,
+        skip_existing=False,
+        diarize=False,
+        srt=True,
+        json=True,
+        no_md=False,
+        num_speakers=None,
+        min_speakers=None,
+        max_speakers=None,
+        max_gap=None,
+        hf_token=None,
+    )
+    calls: list[list[str]] = []
+
+    def fake_call(cmd):
+        calls.append(cmd)
+        if cmd[:3] == [sys.executable, "-m", "speech2md.transcribe"]:
+            if "--json" in cmd:
+                src.with_suffix(".md").write_text("short prose\n", encoding="utf-8")
+                src.with_suffix(".json").write_text("{}", encoding="utf-8")
+                src.with_suffix(".md").unlink()
+            else:
+                src.with_suffix(".md").write_text("long prose\n", encoding="utf-8")
+        elif cmd[:3] == [sys.executable, "-m", "speech2md.align"]:
+            src.with_suffix(".words.json").write_text("{}", encoding="utf-8")
+            src.with_suffix(".srt").write_text("word srt", encoding="utf-8")
+        return 0
+
+    monkeypatch.setattr(transcribe.subprocess, "call", fake_call)
+
+    assert transcribe._run_pipeline(args) == 0
+    assert src.with_suffix(".md").read_text(encoding="utf-8") == "long prose\n"
+    assert calls[0][:3] == [sys.executable, "-m", "speech2md.transcribe"]
+    assert "--json" not in calls[0]
+    assert calls[0][calls[0].index("--target") + 1] == "900.0"
+    assert calls[0][calls[0].index("--max-chunk") + 1] == "1200.0"
+    assert calls[1][:3] == [sys.executable, "-m", "speech2md.transcribe"]
+    assert "--json" in calls[1]
+    assert "--no-md" in calls[1]
+    assert calls[1][calls[1].index("--target") + 1] == "75.0"
+    assert calls[1][calls[1].index("--max-chunk") + 1] == "90.0"
+    assert calls[2][:3] == [sys.executable, "-m", "speech2md.align"]

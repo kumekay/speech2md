@@ -70,6 +70,32 @@ def require_qwen_asr_llm():
     return Qwen3ASRModel
 
 
+def require_cuda(torch, *, command: str) -> None:
+    """Exit with a readable error when CUDA is unavailable.
+
+    vLLM currently falls through to an opaque `Device string must not be empty`
+    traceback on systems with no visible CUDA devices. Check early so CLI users
+    get an actionable message instead.
+    """
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", category=UserWarning)
+        available = bool(torch.cuda.is_available())
+        count = int(torch.cuda.device_count()) if hasattr(torch.cuda, "device_count") else 0
+
+    if available and count > 0:
+        return
+
+    print(
+        "error: no CUDA devices are available for "
+        f"{command}.\n\n"
+        "speech2md currently requires an NVIDIA GPU with working CUDA drivers.\n"
+        "Check that `nvidia-smi` works and that this shell can see the GPU.\n"
+        "If you're running in a container/VM, make sure GPU passthrough is enabled.",
+        file=sys.stderr,
+    )
+    raise SystemExit(3)
+
+
 def require_forced_aligner():
     require_torch()
     try:

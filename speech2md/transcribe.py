@@ -105,10 +105,16 @@ def fmt_ts(seconds: float) -> str:
 # --------------------------------- config ----------------------------------
 
 
+DEFAULT_ASR_TARGET = 900.0
+DEFAULT_ASR_MAX_CHUNK = 1200.0
+DEFAULT_ALIGN_TARGET = 75.0
+DEFAULT_ALIGN_MAX_CHUNK = 90.0
+
+
 @dataclass
 class TranscribeConfig:
-    target: float = 240.0
-    max_chunk: float = 290.0
+    target: float = DEFAULT_ASR_TARGET
+    max_chunk: float = DEFAULT_ASR_MAX_CHUNK
     noise_db: int = -35
     min_sil: float = 0.4
     language: str | None = None
@@ -208,7 +214,14 @@ def load_model(config: TranscribeConfig):
     Spawn the engine subprocess with stderr → /dev/null so its tqdm bars
     and teardown warnings don't leak into our output. The parent's stderr
     is restored on exit so per-file failure messages still surface."""
-    from speech2md._gpu import require_qwen_asr_llm, silenced_stderr
+    from speech2md._gpu import (
+        require_cuda,
+        require_qwen_asr_llm,
+        require_torch,
+        silenced_stderr,
+    )
+    torch = require_torch()
+    require_cuda(torch, command="speech2md")
     Qwen3ASRModel = require_qwen_asr_llm()
     with silenced_stderr():
         return Qwen3ASRModel.LLM(
@@ -303,16 +316,62 @@ def transcribe_one(model, src: Path, args) -> None:
     )
 
 
+def _transcribe_stage_cmd(args, *, keep_json: bool, no_md: bool,
+                          target: float, max_chunk: float) -> list[str]:
+    cmd = [
+        sys.executable, "-m", "speech2md.transcribe",
+        *(str(x) for x in args.inputs),
+        "--target", str(target),
+        "--max-chunk", str(max_chunk),
+        "--noise-db", str(args.noise_db),
+        "--min-sil", str(args.min_sil),
+        "--model", args.model,
+        "--gpu-util", str(args.gpu_util),
+        "--max-model-len", str(args.max_model_len),
+        "--batch", str(args.batch),
+        "--max-new-tokens", str(args.max_new_tokens),
+    ]
+    if keep_json:
+        cmd.append("--json")
+    if no_md:
+        cmd.append("--no-md")
+    if args.language:
+        cmd += ["--language", args.language]
+    if args.keep_chunks:
+        cmd.append("--keep-chunks")
+    if args.skip_existing:
+        cmd.append("--skip-existing")
+    return cmd
+
+
+def _snapshot_markdown(inputs: list[Path]) -> dict[Path, str]:
+    saved: dict[Path, str] = {}
+    for src in inputs:
+        md = src.with_name(f"{src.stem}.md")
+        if md.exists():
+            saved[md] = md.read_text(encoding="utf-8")
+    return saved
+
+
+def _restore_markdown(saved: dict[Path, str]) -> None:
+    for path, content in saved.items():
+        path.write_text(content, encoding="utf-8")
+
+
 # ---------------------------------- main -----------------------------------
 
 
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("inputs", type=Path, nargs="+", help="audio file(s)")
-    p.add_argument("--target", type=float, default=240.0,
-                   help="target chunk seconds (default 240 = 4 min)")
-    p.add_argument("--max-chunk", type=float, default=290.0,
-                   help="hard max chunk seconds (aligner cap is 300; default 290)")
+    p.add_argument("--target", type=float, default=DEFAULT_ASR_TARGET,
+                   help="ASR target chunk seconds (default 900 = 15 min)")
+    p.add_argument("--max-chunk", type=float, default=DEFAULT_ASR_MAX_CHUNK,
+                   help="ASR hard max chunk seconds (default 1200 = 20 min)")
+    p.add_argument("--align-target", type=float, default=DEFAULT_ALIGN_TARGET,
+                   help="pipeline-only: target chunk seconds for the alignment-prep ASR pass (default 75)")
+    p.add_argument("--align-max-chunk", type=float, default=DEFAULT_ALIGN_MAX_CHUNK,
+                   help="pipeline-only: hard max chunk seconds for the alignment-prep ASR pass (default 90)")
     p.add_argument("--noise-db", type=int, default=-35,
                    help="silencedetect noise threshold in dB (default -35)")
     p.add_argument("--min-sil", type=float, default=0.4,
@@ -414,34 +473,35 @@ def _run_pipeline(args) -> int:
 
     Batch semantics: every stage handles all inputs in one subprocess
     call, so each heavy model is loaded exactly once per stage."""
-    # Phase 1: transcribe. Self-subprocess with --json so the chunks
-    # sidecar is on disk for align. No --diarize/--srt on this call, so
-    # the child takes the fast path and won't recurse.
-    transcribe_cmd = [
-        sys.executable, "-m", "speech2md.transcribe",
-        "--json",
-        *(str(x) for x in args.inputs),
-        "--target", str(args.target),
-        "--max-chunk", str(args.max_chunk),
-        "--noise-db", str(args.noise_db),
-        "--min-sil", str(args.min_sil),
-        "--model", args.model,
-        "--gpu-util", str(args.gpu_util),
-        "--max-model-len", str(args.max_model_len),
-        "--batch", str(args.batch),
-        "--max-new-tokens", str(args.max_new_tokens),
-    ]
-    if args.language:
-        transcribe_cmd += ["--language", args.language]
-    if args.keep_chunks:
-        transcribe_cmd.append("--keep-chunks")
-    if args.skip_existing:
-        transcribe_cmd.append("--skip-existing")
-
-    if subprocess.call(transcribe_cmd) != 0:
+    # Phase 1: prose ASR with larger chunks.
+    prose_cmd = _transcribe_stage_cmd(
+        args,
+        keep_json=False,
+        no_md=False,
+        target=args.target,
+        max_chunk=args.max_chunk,
+    )
+    if subprocess.call(prose_cmd) != 0:
         return 1
 
-    # Phase 2: align. Only feed in files whose chunks JSON was actually
+    # Phase 2: alignment-prep ASR with shorter chunks. This pass only keeps
+    # the JSON sidecar for the forced aligner, then the parent restores the
+    # prose markdown from the long-chunk pass.
+    saved_md = _snapshot_markdown(args.inputs)
+    align_prep_cmd = _transcribe_stage_cmd(
+        args,
+        keep_json=True,
+        no_md=True,
+        target=args.align_target,
+        max_chunk=args.align_max_chunk,
+    )
+    try:
+        if subprocess.call(align_prep_cmd) != 0:
+            return 1
+    finally:
+        _restore_markdown(saved_md)
+
+    # Phase 3: align. Only feed in files whose chunks JSON was actually
     # written — a prior failure in phase 1 (or --skip-existing) can
     # leave a subset.
     chunks_jsons = [
@@ -457,7 +517,7 @@ def _run_pipeline(args) -> int:
     if subprocess.call(align_cmd) != 0:
         return 1
 
-    # Phase 3: diarize (only when --diarize).
+    # Phase 4: diarize (only when --diarize).
     if args.diarize:
         words_jsons = [
             src.with_name(f"{src.stem}.words.json") for src in args.inputs
@@ -482,7 +542,7 @@ def _run_pipeline(args) -> int:
         if subprocess.call(diarize_cmd) != 0:
             return 1
 
-    # Phase 4: per-file rename / cleanup to match requested outputs.
+    # Phase 5: per-file rename / cleanup to match requested outputs.
     for src in args.inputs:
         _reconcile_outputs(
             src,

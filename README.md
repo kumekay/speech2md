@@ -117,16 +117,22 @@ diarize-transcription a.words.json b.words.json
    internally.
 6. Per-chunk text is joined with a space and written as prose.
 
-The default chunk target is 4 minutes (`--target 240`) with a 4:50
-hard cap (`--max-chunk 290`). The forced aligner's input cap is
-5 minutes, so staying at or below 290 s keeps the chunks compatible
-with the align step too.
+The default ASR chunk target is 15 minutes (`--target 900`) with a 20
+minute hard cap (`--max-chunk 1200`). When the full pipeline runs
+(`--srt` and/or `--diarize`), `speech2md` does a second ASR prep pass
+just for alignment with much shorter chunks: target 75 s
+(`--align-target 75`), hard cap 90 s (`--align-max-chunk 90`). That
+keeps the forced aligner away from the long-span timestamp collapse
+seen on multi-minute chunks.
 
 ## Word-level timestamps
 
 With `speech2md --srt` the aligner runs as a second subprocess (vLLM
 and the forced aligner together OOM on 24 GB, so they need separate
-processes). The `audio.srt` output has one cue per word.
+processes). In pipeline mode, `speech2md` first writes the prose `.md`
+from larger ASR chunks, then runs a second short-chunk ASR prep pass to
+produce the JSON consumed by the aligner. The `audio.srt` output has one
+cue per word.
 
 The aligner is `Qwen/Qwen3-ForcedAligner-0.6B` — about 1–2 GB VRAM on
 its own.
@@ -156,6 +162,12 @@ First-time setup for diarization:
 2. `huggingface-cli login` once (or pass `--hf-token` to `speech2md` /
    set `$HF_TOKEN`). The command also picks up a cached token at
    `~/.cache/huggingface/token`.
+
+Words are assigned to speakers by maximum overlap between the word's
+aligned time span and diarization turns, with midpoint/nearest-turn
+fallbacks only for exact ties or gaps. A small post-pass can shift a
+single short boundary word across the speaker change when the nearby
+pause structure suggests pyannote was one word late/early.
 
 Segment boundaries are drawn on speaker change, on a pause longer than
 `--max-gap` (default 1.0 s), or on sentence-closing punctuation at the
@@ -193,6 +205,8 @@ full matrix):
 - `--batch 32` — vLLM's `max_inference_batch_size`. Rarely worth
   changing unless you've got a lot of short chunks.
 - `--skip-existing` — no-op on files whose `.md` already exists.
+- `--target 900` / `--max-chunk 1200` — ASR chunk planner target / hard cap.
+- `--align-target 75` / `--align-max-chunk 90` — shorter chunk planner used only for the alignment-prep ASR pass in pipeline mode (`--srt` / `--diarize`).
 - `--keep-chunks` — keep the temporary `wav` chunks for debugging.
 
 `align-transcription`:
