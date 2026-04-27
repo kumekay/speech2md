@@ -233,11 +233,13 @@ def load_model(config: TranscribeConfig):
         )
 
 
-def transcribe_to_paths(model, src: Path, out_md: Path, out_json: Path | None,
+def transcribe_to_paths(model, src: Path, out_md: Path | None,
+                        out_json: Path | None,
                         config: TranscribeConfig) -> dict:
-    """Transcribe `src` to `out_md` (prose) and optionally `out_json`
-    (per-chunk timestamps, consumed by align-transcription).
-    Returns the JSON-shaped payload regardless of whether it was written."""
+    """Transcribe `src` and optionally write the prose to `out_md` and the
+    per-chunk timestamps (consumed by align-transcription) to `out_json`.
+    Either path may be None to suppress that output. Returns the JSON-shaped
+    payload regardless of whether it was written."""
     duration = probe_duration(src)
     silences = detect_silences(src, config.noise_db, config.min_sil)
     segments = plan_splits(duration, silences, config.target, config.max_chunk)
@@ -272,7 +274,8 @@ def transcribe_to_paths(model, src: Path, out_md: Path, out_json: Path | None,
             })
 
         prose = " ".join(c["text"] for c in chunks_out if c["text"])
-        out_md.write_text(prose + "\n", encoding="utf-8")
+        if out_md is not None:
+            out_md.write_text(prose + "\n", encoding="utf-8")
 
         detected = next((c["language"] for c in chunks_out if c["language"]), None)
         data = {
@@ -288,9 +291,10 @@ def transcribe_to_paths(model, src: Path, out_md: Path, out_json: Path | None,
                 json.dumps(data, ensure_ascii=False, indent=2),
                 encoding="utf-8",
             )
-            print(f"  wrote {out_md.name} and {out_json.name}")
-        else:
-            print(f"  wrote {out_md.name}")
+
+        written = [p.name for p in (out_md, out_json) if p is not None]
+        if written:
+            print(f"  wrote {' and '.join(written)}")
 
         return data
     finally:
@@ -302,18 +306,14 @@ def transcribe_to_paths(model, src: Path, out_md: Path, out_json: Path | None,
 
 def transcribe_one(model, src: Path, args) -> None:
     """CLI shim: derive sidecar paths from `src` and call transcribe_to_paths."""
-    out_md = src.with_suffix(".md")
-    out_json = src.with_suffix(".json")
-    if out_md.exists() and args.skip_existing:
-        print(f"skip {src.name} (output exists)")
-        return
-    transcribe_to_paths(
-        model,
-        src,
-        out_md,
-        out_json if args.json else None,
-        _config_from_args(args),
-    )
+    out_md = src.with_suffix(".md") if not args.no_md else None
+    out_json = src.with_suffix(".json") if args.json else None
+    if args.skip_existing:
+        expected = [p for p in (out_md, out_json) if p is not None]
+        if expected and all(p.exists() for p in expected):
+            print(f"skip {src.name} (outputs exist)")
+            return
+    transcribe_to_paths(model, src, out_md, out_json, _config_from_args(args))
 
 
 def _transcribe_stage_cmd(args, *, keep_json: bool, no_md: bool,
@@ -342,20 +342,6 @@ def _transcribe_stage_cmd(args, *, keep_json: bool, no_md: bool,
     if args.skip_existing:
         cmd.append("--skip-existing")
     return cmd
-
-
-def _snapshot_markdown(inputs: list[Path]) -> dict[Path, str]:
-    saved: dict[Path, str] = {}
-    for src in inputs:
-        md = src.with_name(f"{src.stem}.md")
-        if md.exists():
-            saved[md] = md.read_text(encoding="utf-8")
-    return saved
-
-
-def _restore_markdown(saved: dict[Path, str]) -> None:
-    for path, content in saved.items():
-        path.write_text(content, encoding="utf-8")
 
 
 # ---------------------------------- main -----------------------------------
@@ -449,18 +435,6 @@ def _run_transcribe_only(args) -> int:
         for src, err in failures:
             print(f"  {src}: {err}", file=sys.stderr)
 
-    if args.no_md or not args.json:
-        # `speech2md` default-writes .md and optionally .json; reconcile
-        # to honor --no-md / drop --json sidecar when not asked for.
-        for src in args.inputs:
-            _reconcile_outputs(
-                src,
-                diarize=False,
-                srt=False,
-                json_out=args.json,
-                no_md=args.no_md,
-            )
-
     from speech2md._gpu import silence_teardown
     silence_teardown()
     return rc
@@ -472,7 +446,13 @@ def _run_pipeline(args) -> int:
     model gets a clean GPU, then reconcile outputs to match flags.
 
     Batch semantics: every stage handles all inputs in one subprocess
-    call, so each heavy model is loaded exactly once per stage."""
+    call, so each heavy model is loaded exactly once per stage.
+
+    Phases produce non-overlapping artifacts: phase 1 writes <stem>.md
+    (prose), phase 2 writes <stem>.json (alignment-prep chunks), and
+    phase 2's --no-md is honored at the source by transcribe_to_paths,
+    so phase 1's prose is never touched. Reconcile only matters when
+    diarize replaces .md with .speakers.md."""
     # Phase 1: prose ASR with larger chunks.
     prose_cmd = _transcribe_stage_cmd(
         args,
@@ -484,10 +464,9 @@ def _run_pipeline(args) -> int:
     if subprocess.call(prose_cmd) != 0:
         return 1
 
-    # Phase 2: alignment-prep ASR with shorter chunks. This pass only keeps
-    # the JSON sidecar for the forced aligner, then the parent restores the
-    # prose markdown from the long-chunk pass.
-    saved_md = _snapshot_markdown(args.inputs)
+    # Phase 2: alignment-prep ASR with shorter chunks. Writes <stem>.json
+    # only — --no-md means no .md is written at all (phase 1's prose stays
+    # untouched).
     align_prep_cmd = _transcribe_stage_cmd(
         args,
         keep_json=True,
@@ -495,11 +474,8 @@ def _run_pipeline(args) -> int:
         target=args.align_target,
         max_chunk=args.align_max_chunk,
     )
-    try:
-        if subprocess.call(align_prep_cmd) != 0:
-            return 1
-    finally:
-        _restore_markdown(saved_md)
+    if subprocess.call(align_prep_cmd) != 0:
+        return 1
 
     # Phase 3: align. Only feed in files whose chunks JSON was actually
     # written — a prior failure in phase 1 (or --skip-existing) can

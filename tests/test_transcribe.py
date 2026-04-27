@@ -295,11 +295,7 @@ def test_validate_outputs_no_md_with_json_ok():
     transcribe._validate_outputs(no_md=True, srt=False, json_out=True)
 
 
-def test_run_pipeline_uses_short_alignment_chunks_and_restores_prose_md(
-    tmp_path: Path, monkeypatch
-):
-    src = tmp_path / "audio.m4a"
-    src.write_bytes(b"fake")
+def _pipeline_args(src: Path, **overrides) -> SimpleNamespace:
     args = SimpleNamespace(
         inputs=[src],
         target=900.0,
@@ -326,15 +322,25 @@ def test_run_pipeline_uses_short_alignment_chunks_and_restores_prose_md(
         max_gap=None,
         hf_token=None,
     )
+    for k, v in overrides.items():
+        setattr(args, k, v)
+    return args
+
+
+def test_run_pipeline_uses_short_alignment_chunks_and_preserves_prose_md(
+    tmp_path: Path, monkeypatch
+):
+    src = tmp_path / "audio.m4a"
+    src.write_bytes(b"fake")
+    args = _pipeline_args(src)
     calls: list[list[str]] = []
 
     def fake_call(cmd):
         calls.append(cmd)
         if cmd[:3] == [sys.executable, "-m", "speech2md.transcribe"]:
             if "--json" in cmd:
-                src.with_suffix(".md").write_text("short prose\n", encoding="utf-8")
+                # Phase 2 with --no-md writes the json sidecar only.
                 src.with_suffix(".json").write_text("{}", encoding="utf-8")
-                src.with_suffix(".md").unlink()
             else:
                 src.with_suffix(".md").write_text("long prose\n", encoding="utf-8")
         elif cmd[:3] == [sys.executable, "-m", "speech2md.align"]:
@@ -348,6 +354,7 @@ def test_run_pipeline_uses_short_alignment_chunks_and_restores_prose_md(
     assert src.with_suffix(".md").read_text(encoding="utf-8") == "long prose\n"
     assert calls[0][:3] == [sys.executable, "-m", "speech2md.transcribe"]
     assert "--json" not in calls[0]
+    assert "--no-md" not in calls[0]
     assert calls[0][calls[0].index("--target") + 1] == "900.0"
     assert calls[0][calls[0].index("--max-chunk") + 1] == "1200.0"
     assert calls[1][:3] == [sys.executable, "-m", "speech2md.transcribe"]
@@ -356,3 +363,72 @@ def test_run_pipeline_uses_short_alignment_chunks_and_restores_prose_md(
     assert calls[1][calls[1].index("--target") + 1] == "75.0"
     assert calls[1][calls[1].index("--max-chunk") + 1] == "90.0"
     assert calls[2][:3] == [sys.executable, "-m", "speech2md.align"]
+
+
+def test_transcribe_one_skip_existing_checks_actual_outputs(
+    tmp_path: Path, monkeypatch
+):
+    """Regression for the diarize bug: with --no-md --json --skip-existing,
+    the skip check must look at the .json sidecar — not at .md, which is
+    irrelevant to this invocation. Previously phase 2 of the pipeline
+    short-circuited because phase 1's .md confused the skip check."""
+    src = _src(tmp_path)
+    out_md = src.with_suffix(".md")
+    out_md.write_text("phase 1 prose", encoding="utf-8")  # left over from phase 1
+
+    ran = []
+    monkeypatch.setattr(
+        transcribe, "transcribe_to_paths",
+        lambda *a, **kw: ran.append((a, kw)) or {},
+    )
+
+    args = SimpleNamespace(
+        inputs=[src],
+        target=75.0, max_chunk=90.0, align_target=75.0, align_max_chunk=90.0,
+        noise_db=-35, min_sil=0.4, language=None,
+        model="Qwen/Qwen3-ASR-1.7B", gpu_util=0.6, max_model_len=8192,
+        batch=32, max_new_tokens=4096, keep_chunks=False,
+        skip_existing=True, no_md=True, json=True,
+    )
+
+    transcribe.transcribe_one(object(), src, args)
+    assert ran, "phase 2 must run; the .md from phase 1 should not block it"
+
+
+def test_transcribe_one_skip_existing_skips_when_outputs_present(
+    tmp_path: Path, monkeypatch
+):
+    src = _src(tmp_path)
+    src.with_suffix(".json").write_text("{}", encoding="utf-8")
+
+    ran = []
+    monkeypatch.setattr(
+        transcribe, "transcribe_to_paths",
+        lambda *a, **kw: ran.append((a, kw)) or {},
+    )
+
+    args = SimpleNamespace(
+        inputs=[src],
+        target=75.0, max_chunk=90.0, align_target=75.0, align_max_chunk=90.0,
+        noise_db=-35, min_sil=0.4, language=None,
+        model="Qwen/Qwen3-ASR-1.7B", gpu_util=0.6, max_model_len=8192,
+        batch=32, max_new_tokens=4096, keep_chunks=False,
+        skip_existing=True, no_md=True, json=True,
+    )
+
+    transcribe.transcribe_one(object(), src, args)
+    assert not ran
+
+
+def test_transcribe_to_paths_no_md_writes_only_json(tmp_path: Path, fake_ffmpeg):
+    src = _src(tmp_path)
+    out_md = tmp_path / "transcript.md"
+    out_json = tmp_path / "transcript.json"
+
+    transcribe.transcribe_to_paths(
+        FakeModel([FakeResult(text="hi")]),
+        src, None, out_json, transcribe.TranscribeConfig(),
+    )
+
+    assert not out_md.exists()
+    assert out_json.exists()
